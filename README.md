@@ -18,3 +18,16 @@ Optional settings:
 - `MIRROR_BIND`: listening address. Default: `0.0.0.0:3000`.
 
 Only the configured destination is reachable. This is not an open forward proxy.
+
+## Docker
+
+Pass the destination directly when starting the published image:
+
+```sh
+docker run --rm --name mirror-frontend \
+  -e MIRROR_UPSTREAM=https://example.com \
+  -p 3000:3000 \
+  ghcr.io/parksnoopy/mirror-frontend:latest
+```
+
+`MIRROR_UPSTREAM` is required; the container exits when it is missing. Images support `linux/amd64` and `linux/arm64`. Pushing a version tag such as `v1.2.3` publishes `latest`, `1.2.3`, `1.2`, and a commit tag.

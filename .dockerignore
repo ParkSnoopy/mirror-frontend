@@ -1,0 +1,7 @@
+.git
+.github
+.env
+.env.*
+target
+README.md
+rustfmt.toml
