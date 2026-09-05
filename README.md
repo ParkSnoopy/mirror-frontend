@@ -21,7 +21,21 @@ Only the configured destination is reachable. This is not an open forward proxy.
 
 ## Docker
 
-Pass the destination and listening address directly when starting the published image. For a Docker network named `app-network`:
+Pass the destination and listening address directly when starting the published image.
+
+### Host access
+
+```sh
+docker run --rm --name mirror-frontend \
+  -e MIRROR_UPSTREAM=https://example.com \
+  -e MIRROR_BIND=0.0.0.0:8080 \
+  -p 8080:8080 \
+  ghcr.io/parksnoopy/mirror-frontend:latest
+```
+
+The host can use `http://localhost:8080`.
+
+### Docker network
 
 ```sh
 docker run --rm --name mirror-frontend \
@@ -31,6 +45,6 @@ docker run --rm --name mirror-frontend \
   ghcr.io/parksnoopy/mirror-frontend:latest
 ```
 
-Other containers on that network can use `http://mirror-frontend:8080`. Add `-p 8080:8080` only when host access is also needed.
+Other containers on `app-network` can use `http://mirror-frontend:8080`.
 
-`MIRROR_UPSTREAM` is required; the container exits when it is missing. `MIRROR_BIND` selects any listening address and port. Images support `linux/amd64` and `linux/arm64`. Pushing a version tag such as `v1.2.3` publishes `latest`, `1.2.3`, `1.2`, and a commit tag.
+`MIRROR_UPSTREAM` is required; the container exits when it is missing. `MIRROR_BIND` selects any listening address and port. Images support `linux/amd64`. Pushing a version tag such as `v1.2.3` publishes `latest`, `1.2.3`, `1.2`, and a commit tag.
