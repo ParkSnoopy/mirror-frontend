@@ -10,5 +10,4 @@ FROM debian:bookworm-slim
 COPY --from=builder --chown=65532:65532 /build/target/release/mirror-frontend /usr/local/bin/mirror-frontend
 
 USER 65532:65532
-EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/mirror-frontend"]
