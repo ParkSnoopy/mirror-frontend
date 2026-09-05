@@ -1,6 +1,6 @@
 # Mirror Frontend
 
-Mirror Frontend exposes one configured HTTP or HTTPS website through your own server. Incoming paths, queries, methods, request bodies, and response bodies pass through this server. Redirects and absolute URLs in text responses are rewritten to keep browsing on the proxy address. Large binary downloads are streamed without buffering.
+Mirror Frontend exposes one configured HTTPS website through your own server. Incoming paths, queries, methods, request bodies, and response bodies pass through this server. Redirects and absolute URLs in text responses are rewritten to keep browsing on the proxy address. Large binary downloads are streamed without buffering.
 
 ## Run
 
@@ -11,7 +11,7 @@ cp .env.example .env
 cargo run --release
 ```
 
-Open the server through any public hostname. Mirror Frontend derives that address from each request and uses `X-Forwarded-Host` and `X-Forwarded-Proto` when an HTTPS reverse proxy supplies them. A destination hostname without a scheme uses HTTPS. Existing environment variables override matching `.env` values.
+Open the server through any public hostname. Mirror Frontend derives that address from each request and uses `X-Forwarded-Host` and `X-Forwarded-Proto` when an HTTPS reverse proxy supplies them. `MIRROR_UPSTREAM` accepts only a hostname such as `mirror.example.com`; schemes, ports, paths, and trailing slashes are rejected. Upstream requests use HTTPS. Existing environment variables override matching `.env` values.
 
 Optional settings:
 
@@ -27,7 +27,7 @@ Pass the destination and listening address directly when starting the published 
 
 ```sh
 docker run --rm --name mirror-frontend \
-  -e MIRROR_UPSTREAM=https://example.com \
+  -e MIRROR_UPSTREAM=example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
   -p 8080:8080 \
   ghcr.io/parksnoopy/mirror-frontend:latest
@@ -40,7 +40,7 @@ The host can use `http://localhost:8080`.
 ```sh
 docker run --rm --name mirror-frontend \
   --network app-network \
-  -e MIRROR_UPSTREAM=https://example.com \
+  -e MIRROR_UPSTREAM=example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
   ghcr.io/parksnoopy/mirror-frontend:latest
 ```

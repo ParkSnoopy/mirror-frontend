@@ -45,7 +45,7 @@ async fn run() -> Result<(), String> {
     load_env_file()?;
     let upstream = env::var(UPSTREAM_ENV)
         .map_err(|_| format!("{UPSTREAM_ENV} is required"))
-        .and_then(|value| parse_http_url(&value, UPSTREAM_ENV))?;
+        .and_then(|value| parse_upstream_host(&value))?;
     let bind = env::var(BIND_ENV).unwrap_or_else(|_| "0.0.0.0:3000".to_owned());
     let bind: SocketAddr = bind
         .parse()
@@ -154,6 +154,32 @@ fn parse_http_url(value: &str, name: &str) -> Result<Url, String> {
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);
+    }
+    Ok(url)
+}
+
+fn parse_upstream_host(value: &str) -> Result<Url, String> {
+    let error = || {
+        format!(
+            "{UPSTREAM_ENV} must be a hostname without scheme, port, path, query, or fragment"
+        )
+    };
+    if value.is_empty()
+        || value.trim() != value
+        || value.contains(['/', ':', '?', '#', '@'])
+    {
+        return Err(error());
+    }
+    let url = Url::parse(&format!("https://{value}")).map_err(|_| error())?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(error());
     }
     Ok(url)
 }
@@ -375,21 +401,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_host_and_preserves_configured_base_path() {
-        let upstream = parse_http_url("upstream.example/pub", UPSTREAM_ENV).unwrap();
+    fn parses_clean_upstream_hostname() {
+        let upstream = parse_upstream_host("upstream.example").unwrap();
         let uri = "/linux/file.iso?download=1".parse().unwrap();
 
-        assert_eq!(upstream.as_str(), "https://upstream.example/pub/");
+        assert_eq!(upstream.as_str(), "https://upstream.example/");
         assert_eq!(
             target_url(&upstream, &uri).as_str(),
-            "https://upstream.example/pub/linux/file.iso?download=1"
+            "https://upstream.example/linux/file.iso?download=1"
         );
     }
 
     #[test]
-    fn rejects_non_http_upstreams_and_credentials() {
-        assert!(parse_http_url("ftp://upstream.example", UPSTREAM_ENV).is_err());
-        assert!(parse_http_url("https://user:secret@example.com", UPSTREAM_ENV).is_err());
+    fn rejects_upstream_values_that_are_not_clean_hostnames() {
+        for value in [
+            "https://mirror.example.com",
+            "http://mirror.example.com/",
+            "https://mirror.example.com/",
+            "mirror.example.com/",
+            "mirror.example.com:443",
+            "mirror.example.com/path",
+            "mirror.example.com?query",
+            "user@mirror.example.com",
+        ] {
+            assert!(parse_upstream_host(value).is_err(), "accepted {value}");
+        }
     }
 
     #[test]
