@@ -1,14 +1,19 @@
 use std::{
     collections::HashSet,
     env,
+    fmt,
     net::SocketAddr,
     sync::Arc,
+    time::SystemTime,
 };
 
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{
+        ConnectInfo,
+        State,
+    },
     http::{
         HeaderMap,
         HeaderName,
@@ -26,17 +31,19 @@ use url::Url;
 
 const UPSTREAM_ENV: &str = "MIRROR_UPSTREAM";
 const BIND_ENV: &str = "MIRROR_BIND";
+const DEBUG_ENV: &str = "DEBUG";
 
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
     upstream: Url,
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        eprintln!("mirror-frontend: {error}");
+        log(LogCategory::Err, &format!("startup failed: {error}"));
         std::process::exit(1);
     }
 }
@@ -50,21 +57,28 @@ async fn run() -> Result<(), String> {
     let bind: SocketAddr = bind
         .parse()
         .map_err(|error| format!("invalid {BIND_ENV}: {error}"))?;
+    let debug = parse_debug(env::var(DEBUG_ENV).ok().as_deref())?;
     let state = AppState {
         client: reqwest::Client::builder()
             .redirect(Policy::none())
             .build()
             .map_err(|error| format!("cannot build HTTP client: {error}"))?,
         upstream,
+        debug,
     };
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|error| format!("cannot listen on {bind}: {error}"))?;
-    println!("Proxying {} at http://{bind}", state.upstream);
+    if debug {
+        log(LogCategory::Info, &format!("listening={bind}"));
+    }
 
-    axum::serve(listener, app(state))
-        .await
-        .map_err(|error| format!("server failed: {error}"))
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|error| format!("server failed: {error}"))
 }
 
 fn load_env_file() -> Result<(), String> {
@@ -72,6 +86,14 @@ fn load_env_file() -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("cannot load .env: {error}")),
+    }
+}
+
+fn parse_debug(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(format!("{DEBUG_ENV} must be true or false")),
     }
 }
 
@@ -85,26 +107,47 @@ async fn proxy(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
-    let public_url = request_public_url(&request)?;
-    let target = target_url(&state.upstream, request.uri());
-    let (parts, body) = request.into_parts();
-    let mut headers = filtered_headers(&parts.headers, true);
-    rewrite_request_headers(&mut headers, &public_url, &state.upstream);
-    headers.insert(
-        header::ACCEPT_ENCODING,
-        HeaderValue::from_static("identity"),
-    );
+    let client_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|connect_info| connect_info.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let path = request.uri().path().to_owned();
+    let result = async {
+        let public_url = request_public_url(&request)?;
+        let target = target_url(&state.upstream, request.uri());
+        let (parts, body) = request.into_parts();
+        let mut headers = filtered_headers(&parts.headers, true);
+        rewrite_request_headers(&mut headers, &public_url, &state.upstream);
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
 
-    let upstream_response = state
-        .client
-        .request(parts.method, target)
-        .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
-        .send()
-        .await
-        .map_err(ProxyError::Upstream)?;
+        let upstream_response = state
+            .client
+            .request(parts.method, target)
+            .headers(headers)
+            .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+            .send()
+            .await
+            .map_err(|_| ProxyError::Upstream)?;
 
-    build_response(upstream_response, &state.upstream, &public_url).await
+        build_response(upstream_response, &state.upstream, &public_url).await
+    }
+    .await;
+
+    if state.debug {
+        let status = match &result {
+            Ok(response) => response.status(),
+            Err(error) => error.status(),
+        };
+        log(
+            LogCategory::for_status(status),
+            &format!("ip={client_ip} path={path} status={status}"),
+        );
+    }
+    result
 }
 
 async fn build_response(
@@ -123,7 +166,7 @@ async fn build_response(
         let bytes = upstream_response
             .bytes()
             .await
-            .map_err(ProxyError::Upstream)?;
+            .map_err(|_| ProxyError::Upstream)?;
         Body::from(rewrite_bytes(&bytes, upstream, public_url))
     } else {
         Body::from_stream(upstream_response.bytes_stream())
@@ -160,14 +203,9 @@ fn parse_http_url(value: &str, name: &str) -> Result<Url, String> {
 
 fn parse_upstream_host(value: &str) -> Result<Url, String> {
     let error = || {
-        format!(
-            "{UPSTREAM_ENV} must be a hostname without scheme, port, path, query, or fragment"
-        )
+        format!("{UPSTREAM_ENV} must be a hostname without scheme, port, path, query, or fragment")
     };
-    if value.is_empty()
-        || value.trim() != value
-        || value.contains(['/', ':', '?', '#', '@'])
-    {
+    if value.is_empty() || value.trim() != value || value.contains(['/', ':', '?', '#', '@']) {
         return Err(error());
     }
     let url = Url::parse(&format!("https://{value}")).map_err(|_| error())?;
@@ -378,19 +416,59 @@ fn authority(url: &Url) -> String {
 #[derive(Debug)]
 enum ProxyError {
     BadRequest(&'static str),
-    Upstream(reqwest::Error),
+    Upstream,
+}
+
+impl ProxyError {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Upstream => StatusCode::BAD_GATEWAY,
+        }
+    }
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> axum::response::Response {
         match self {
             Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message).into_response(),
-            Self::Upstream(error) => {
-                eprintln!("upstream request failed: {error}");
-                (StatusCode::BAD_GATEWAY, "upstream request failed").into_response()
-            }
+            Self::Upstream => (StatusCode::BAD_GATEWAY, "upstream request failed").into_response(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogCategory {
+    Info,
+    Warn,
+    Err,
+}
+
+impl LogCategory {
+    fn for_status(status: StatusCode) -> Self {
+        if status.is_server_error() {
+            Self::Err
+        } else if status.is_client_error() {
+            Self::Warn
+        } else {
+            Self::Info
+        }
+    }
+}
+
+impl fmt::Display for LogCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.pad(match self {
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Err => "ERR",
+        })
+    }
+}
+
+fn log(category: LogCategory, message: &str) {
+    let timestamp = humantime::format_rfc3339_seconds(SystemTime::now());
+    eprintln!("{timestamp} {category:<4} {message}");
 }
 
 #[cfg(test)]
@@ -399,6 +477,34 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn parses_debug_setting() {
+        assert!(!parse_debug(None).unwrap());
+        assert!(!parse_debug(Some("false")).unwrap());
+        assert!(parse_debug(Some("true")).unwrap());
+        assert!(parse_debug(Some("TRUE")).is_err());
+        assert!(parse_debug(Some("1")).is_err());
+    }
+
+    #[test]
+    fn categorizes_request_status() {
+        assert_eq!(LogCategory::for_status(StatusCode::OK), LogCategory::Info);
+        assert_eq!(
+            LogCategory::for_status(StatusCode::NOT_FOUND),
+            LogCategory::Warn
+        );
+        assert_eq!(
+            LogCategory::for_status(StatusCode::BAD_GATEWAY),
+            LogCategory::Err
+        );
+        assert_eq!(LogCategory::Info.to_string(), "INFO");
+        assert_eq!(LogCategory::Warn.to_string(), "WARN");
+        assert_eq!(LogCategory::Err.to_string(), "ERR");
+        assert_eq!(format!("{:<4}", LogCategory::Info), "INFO");
+        assert_eq!(format!("{:<4}", LogCategory::Warn), "WARN");
+        assert_eq!(format!("{:<4}", LogCategory::Err), "ERR ");
+    }
 
     #[test]
     fn parses_clean_upstream_hostname() {
@@ -472,6 +578,7 @@ mod tests {
         let state = AppState {
             client: reqwest::Client::new(),
             upstream: Url::parse("https://example.com/").unwrap(),
+            debug: false,
         };
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
 
@@ -529,6 +636,7 @@ mod tests {
                 .build()
                 .unwrap(),
             upstream: Url::parse(&format!("{upstream_origin}/base/")).unwrap(),
+            debug: false,
         };
         let request = Request::builder()
             .method("POST")

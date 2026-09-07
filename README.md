@@ -16,6 +16,9 @@ Open the server through any public hostname. Mirror Frontend derives that addres
 Optional settings:
 
 - `MIRROR_BIND`: listening address. Default: `0.0.0.0:3000`.
+- `DEBUG`: set to `true` for terminal request logs or `false` to disable them. Default: `false`.
+
+Debug logs include a UTC timestamp, `INFO`, `WARN`, or `ERR` category, client IP address, request path, and response status. Query strings are omitted.
 
 Only the configured destination is reachable. This is not an open forward proxy.
 
@@ -29,6 +32,7 @@ Pass the destination and listening address directly when starting the published 
 docker run --rm --name mirror-frontend \
   -e MIRROR_UPSTREAM=example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
+  -e DEBUG=false \
   -p 8080:8080 \
   ghcr.io/parksnoopy/mirror-frontend:latest
 ```
@@ -42,6 +46,7 @@ docker run --rm --name mirror-frontend \
   --network app-network \
   -e MIRROR_UPSTREAM=example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
+  -e DEBUG=false \
   ghcr.io/parksnoopy/mirror-frontend:latest
 ```
 
