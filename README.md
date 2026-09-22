@@ -16,6 +16,7 @@ Open the server through any public hostname. Mirror Frontend derives that addres
 Optional settings:
 
 - `MIRROR_BIND`: listening address. Default: `0.0.0.0:3000`.
+- `SHADOW_DOMAIN`: clean hostname used when rewriting URLs in response content and response headers. Rewrites use `https://SHADOW_DOMAIN`; leave it empty to use each request's public address. The upstream request target remains `MIRROR_UPSTREAM`.
 - `DEBUG`: set to `true` for terminal request logs or `false` to disable them. Default: `false`.
 
 Debug logs include a UTC timestamp, `INFO`, `WARN`, or `ERR` category, client IP address, request path, and response status. Query strings are omitted.
@@ -31,6 +32,7 @@ Pass the destination and listening address directly when starting the published 
 ```sh
 docker run --rm --name mirror-frontend \
   -e MIRROR_UPSTREAM=example.com \
+  -e SHADOW_DOMAIN=shadow.example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
   -e DEBUG=false \
   -p 8080:8080 \
@@ -45,6 +47,7 @@ The host can use `http://localhost:8080`.
 docker run --rm --name mirror-frontend \
   --network app-network \
   -e MIRROR_UPSTREAM=example.com \
+  -e SHADOW_DOMAIN=shadow.example.com \
   -e MIRROR_BIND=0.0.0.0:8080 \
   -e DEBUG=false \
   ghcr.io/parksnoopy/mirror-frontend:latest

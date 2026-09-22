@@ -30,6 +30,7 @@ use reqwest::redirect::Policy;
 use url::Url;
 
 const UPSTREAM_ENV: &str = "MIRROR_UPSTREAM";
+const SHADOW_DOMAIN_ENV: &str = "SHADOW_DOMAIN";
 const BIND_ENV: &str = "MIRROR_BIND";
 const DEBUG_ENV: &str = "DEBUG";
 
@@ -37,6 +38,7 @@ const DEBUG_ENV: &str = "DEBUG";
 struct AppState {
     client: reqwest::Client,
     upstream: Url,
+    shadow_domain: Option<Url>,
     debug: bool,
 }
 
@@ -57,6 +59,10 @@ async fn run() -> Result<(), String> {
     let bind: SocketAddr = bind
         .parse()
         .map_err(|error| format!("invalid {BIND_ENV}: {error}"))?;
+    let shadow_domain = parse_optional_host(
+        SHADOW_DOMAIN_ENV,
+        env::var(SHADOW_DOMAIN_ENV).ok().as_deref(),
+    )?;
     let debug = parse_debug(env::var(DEBUG_ENV).ok().as_deref())?;
     let state = AppState {
         client: reqwest::Client::builder()
@@ -64,6 +70,7 @@ async fn run() -> Result<(), String> {
             .build()
             .map_err(|error| format!("cannot build HTTP client: {error}"))?,
         upstream,
+        shadow_domain,
         debug,
     };
     let listener = tokio::net::TcpListener::bind(bind)
@@ -115,6 +122,7 @@ async fn proxy(
     let path = request.uri().path().to_owned();
     let result = async {
         let public_url = request_public_url(&request)?;
+        let rewrite_url = state.shadow_domain.as_ref().unwrap_or(&public_url);
         let target = target_url(&state.upstream, request.uri());
         let (parts, body) = request.into_parts();
         let mut headers = filtered_headers(&parts.headers, true);
@@ -133,7 +141,7 @@ async fn proxy(
             .await
             .map_err(|_| ProxyError::Upstream)?;
 
-        build_response(upstream_response, &state.upstream, &public_url).await
+        build_response(upstream_response, &state.upstream, rewrite_url).await
     }
     .await;
 
@@ -202,9 +210,18 @@ fn parse_http_url(value: &str, name: &str) -> Result<Url, String> {
 }
 
 fn parse_upstream_host(value: &str) -> Result<Url, String> {
-    let error = || {
-        format!("{UPSTREAM_ENV} must be a hostname without scheme, port, path, query, or fragment")
-    };
+    parse_host(UPSTREAM_ENV, value)
+}
+
+fn parse_optional_host(name: &str, value: Option<&str>) -> Result<Option<Url>, String> {
+    match value {
+        None | Some("") => Ok(None),
+        Some(value) => parse_host(name, value).map(Some),
+    }
+}
+
+fn parse_host(name: &str, value: &str) -> Result<Url, String> {
+    let error = || format!("{name} must be a hostname without scheme, port, path, query, or fragment");
     if value.is_empty() || value.trim() != value || value.contains(['/', ':', '?', '#', '@']) {
         return Err(error());
     }
@@ -516,6 +533,23 @@ mod tests {
             target_url(&upstream, &uri).as_str(),
             "https://upstream.example/linux/file.iso?download=1"
         );
+        assert_eq!(
+            parse_optional_host(SHADOW_DOMAIN_ENV, Some("shadow.example"))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "https://shadow.example/"
+        );
+        assert!(
+            parse_optional_host(SHADOW_DOMAIN_ENV, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_optional_host(SHADOW_DOMAIN_ENV, Some(""))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -531,6 +565,10 @@ mod tests {
             "user@mirror.example.com",
         ] {
             assert!(parse_upstream_host(value).is_err(), "accepted {value}");
+            assert!(
+                parse_optional_host(SHADOW_DOMAIN_ENV, Some(value)).is_err(),
+                "accepted shadow domain {value}"
+            );
         }
     }
 
@@ -573,11 +611,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rewrites_cors_and_redirect_headers_to_shadow_domain() {
+        let upstream = Url::parse("https://upstream.example/").unwrap();
+        let shadow = Url::parse("https://shadow.example/").unwrap();
+        let mut headers = HeaderMap::from_iter([
+            (
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("https://upstream.example"),
+            ),
+            (
+                header::LOCATION,
+                HeaderValue::from_static("http://upstream.example/asset.js"),
+            ),
+        ]);
+
+        rewrite_response_headers(&mut headers, &upstream, &shadow);
+
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://shadow.example"
+        );
+        assert_eq!(
+            headers[header::LOCATION],
+            "https://shadow.example/asset.js"
+        );
+    }
+
     #[tokio::test]
     async fn missing_host_is_rejected() {
         let state = AppState {
             client: reqwest::Client::new(),
             upstream: Url::parse("https://example.com/").unwrap(),
+            shadow_domain: None,
             debug: false,
         };
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
@@ -630,27 +696,38 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(listener, upstream_app).await.unwrap();
         });
-        let state = AppState {
-            client: reqwest::Client::builder()
-                .redirect(Policy::none())
-                .build()
-                .unwrap(),
-            upstream: Url::parse(&format!("{upstream_origin}/base/")).unwrap(),
-            debug: false,
-        };
-        let request = Request::builder()
-            .method("POST")
-            .uri("/nested?q=1")
-            .header(header::HOST, "mirror.example")
-            .body(Body::from("payload"))
-            .unwrap();
+        for (shadow_domain, expected_origin) in [
+            (None, "http://mirror.example"),
+            (
+                Some(Url::parse("https://shadow.example/").unwrap()),
+                "https://shadow.example",
+            ),
+        ] {
+            let state = AppState {
+                client: reqwest::Client::builder()
+                    .redirect(Policy::none())
+                    .build()
+                    .unwrap(),
+                upstream: Url::parse(&format!("{upstream_origin}/base/")).unwrap(),
+                shadow_domain,
+                debug: false,
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri("/nested?q=1")
+                .header(header::HOST, "mirror.example")
+                .body(Body::from("payload"))
+                .unwrap();
 
-        let response = app(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            to_bytes(response.into_body(), 4096).await.unwrap(),
-            "POST /base/nested?q=1 payload <a href=\"http://mirror.example/asset\">asset</a>"
-        );
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+                format!(
+                    "POST /base/nested?q=1 payload <a href=\"{expected_origin}/asset\">asset</a>"
+                )
+            );
+        }
         server.abort();
     }
 }
