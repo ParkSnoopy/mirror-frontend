@@ -2,6 +2,8 @@
 
 Mirror Frontend exposes one configured HTTPS website through your own server. Incoming paths, queries, methods, request bodies, and response bodies pass through this server. Redirects and absolute URLs in text responses are rewritten to keep browsing on the proxy address. Large binary downloads are streamed without buffering.
 
+For code structure, request flow, configuration, and maintenance, see [LLM_WIKI.md](./LLM_WIKI.md).
+
 ## Run
 
 Copy the example configuration, edit `.env`, then start the server:
