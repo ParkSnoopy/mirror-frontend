@@ -33,12 +33,16 @@ const UPSTREAM_ENV: &str = "MIRROR_UPSTREAM";
 const SHADOW_DOMAIN_ENV: &str = "SHADOW_DOMAIN";
 const BIND_ENV: &str = "MIRROR_BIND";
 const DEBUG_ENV: &str = "DEBUG";
+const GOOGLE_FAIL_ENV: &str = "GOOGLE_FAIL";
+const GOOGLE_FAIL_PATH: &str = "/__mirror_google_fail";
+const GOOGLE_FAIL_DOMAINS: &str = include_str!("../google-fail-domains.txt");
 
 #[derive(Clone)]
 struct AppState {
     client: reqwest::Client,
     upstream: Url,
     shadow_domain: Option<Url>,
+    google_fail: Option<StatusCode>,
     debug: bool,
 }
 
@@ -64,6 +68,11 @@ async fn run() -> Result<(), String> {
         env::var(SHADOW_DOMAIN_ENV).ok().as_deref(),
     )?;
     let debug = parse_debug(env::var(DEBUG_ENV).ok().as_deref())?;
+    let google_fail = match env::var(GOOGLE_FAIL_ENV) {
+        Ok(value) => parse_google_fail(Some(&value))?,
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(format!("invalid {GOOGLE_FAIL_ENV}: {error}")),
+    };
     let state = AppState {
         client: reqwest::Client::builder()
             .redirect(Policy::none())
@@ -71,6 +80,7 @@ async fn run() -> Result<(), String> {
             .map_err(|error| format!("cannot build HTTP client: {error}"))?,
         upstream,
         shadow_domain,
+        google_fail,
         debug,
     };
     let listener = tokio::net::TcpListener::bind(bind)
@@ -110,6 +120,33 @@ fn app(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
+fn parse_google_fail(value: Option<&str>) -> Result<Option<StatusCode>, String> {
+    value
+        .map(|value| {
+            value
+                .parse::<StatusCode>()
+                .ok()
+                .filter(|status| (200..600).contains(&status.as_u16()))
+                .ok_or_else(|| {
+                    format!("{GOOGLE_FAIL_ENV} must be an HTTP status code from 200 to 599")
+                })
+        })
+        .transpose()
+}
+
+fn is_google_service(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.');
+    GOOGLE_FAIL_DOMAINS
+        .lines()
+        .map(str::trim)
+        .filter(|domain| !domain.is_empty() && !domain.starts_with('#'))
+        .any(|domain| {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            host.strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
+        })
+}
+
 async fn proxy(
     State(state): State<Arc<AppState>>,
     request: Request<Body>,
@@ -122,7 +159,13 @@ async fn proxy(
     let path = request.uri().path().to_owned();
     let result = async {
         let public_url = request_public_url(&request)?;
-        let rewrite_url = state.shadow_domain.as_ref().unwrap_or(&public_url);
+        if let Some(status) = state.google_fail
+            && (is_google_service(&state.upstream)
+                || path == GOOGLE_FAIL_PATH
+                || path.starts_with(&format!("{GOOGLE_FAIL_PATH}/")))
+        {
+            return Ok(status.into_response());
+        }
         let target = target_url(&state.upstream, request.uri());
         let (parts, body) = request.into_parts();
         let mut headers = filtered_headers(&parts.headers, true);
@@ -141,7 +184,7 @@ async fn proxy(
             .await
             .map_err(|_| ProxyError::Upstream)?;
 
-        build_response(upstream_response, &state.upstream, rewrite_url).await
+        build_response(upstream_response, &state, &public_url).await
     }
     .await;
 
@@ -160,22 +203,24 @@ async fn proxy(
 
 async fn build_response(
     upstream_response: reqwest::Response,
-    upstream: &Url,
+    state: &AppState,
     public_url: &Url,
 ) -> Result<Response<Body>, ProxyError> {
+    let rewrite_url = state.shadow_domain.as_ref().unwrap_or(public_url);
+    let google_url = state.google_fail.map(|_| public_url);
     let status = upstream_response.status();
     let source_headers = upstream_response.headers().clone();
     let rewrite_body =
         is_rewritable(&source_headers) && !source_headers.contains_key(header::CONTENT_ENCODING);
     let mut headers = filtered_headers(&source_headers, rewrite_body);
-    rewrite_response_headers(&mut headers, upstream, public_url);
+    rewrite_response_headers(&mut headers, &state.upstream, rewrite_url, google_url);
 
     let body = if rewrite_body {
         let bytes = upstream_response
             .bytes()
             .await
             .map_err(|_| ProxyError::Upstream)?;
-        Body::from(rewrite_bytes(&bytes, upstream, public_url))
+        Body::from(rewrite_bytes(&bytes, &state.upstream, rewrite_url, google_url))
     } else {
         Body::from_stream(upstream_response.bytes_stream())
     };
@@ -316,11 +361,16 @@ fn hop_by_hop_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
 
 fn rewrite_request_headers(headers: &mut HeaderMap, public_url: &Url, upstream: &Url) {
     for name in [header::ORIGIN, header::REFERER] {
-        rewrite_header(headers, name, public_url, upstream);
+        rewrite_header(headers, name, public_url, upstream, None);
     }
 }
 
-fn rewrite_response_headers(headers: &mut HeaderMap, upstream: &Url, public_url: &Url) {
+fn rewrite_response_headers(
+    headers: &mut HeaderMap,
+    upstream: &Url,
+    public_url: &Url,
+    google_url: Option<&Url>,
+) {
     for name in [
         header::LOCATION,
         header::CONTENT_LOCATION,
@@ -329,17 +379,23 @@ fn rewrite_response_headers(headers: &mut HeaderMap, upstream: &Url, public_url:
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         header::CONTENT_SECURITY_POLICY,
     ] {
-        rewrite_header(headers, name, upstream, public_url);
+        rewrite_header(headers, name, upstream, public_url, google_url);
     }
     rewrite_cookies(headers, upstream);
 }
 
-fn rewrite_header(headers: &mut HeaderMap, name: HeaderName, from: &Url, to: &Url) {
+fn rewrite_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    from: &Url,
+    to: &Url,
+    google_url: Option<&Url>,
+) {
     let values: Vec<_> = headers
         .get_all(&name)
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .map(|value| rewrite_text(value, from, to))
+        .map(|value| rewrite_text(value, from, to, google_url))
         .filter_map(|value| HeaderValue::from_str(&value).ok())
         .collect();
     if values.is_empty() {
@@ -404,14 +460,14 @@ fn is_rewritable(headers: &HeaderMap) -> bool {
         })
 }
 
-fn rewrite_bytes(bytes: &[u8], from: &Url, to: &Url) -> Vec<u8> {
+fn rewrite_bytes(bytes: &[u8], from: &Url, to: &Url, google_url: Option<&Url>) -> Vec<u8> {
     match std::str::from_utf8(bytes) {
-        Ok(text) => rewrite_text(text, from, to).into_bytes(),
+        Ok(text) => rewrite_text(text, from, to, google_url).into_bytes(),
         Err(_) => bytes.to_vec(),
     }
 }
 
-fn rewrite_text(value: &str, from: &Url, to: &Url) -> String {
+fn rewrite_text(value: &str, from: &Url, to: &Url, google_url: Option<&Url>) -> String {
     let to_origin = to.origin().ascii_serialization();
     let from_authority = authority(from);
     let to_authority = authority(to);
@@ -420,7 +476,61 @@ fn rewrite_text(value: &str, from: &Url, to: &Url) -> String {
     for scheme in ["https", "http", "ftp", "rsync"] {
         rewritten = rewritten.replace(&format!("{scheme}://{from_authority}"), &to_origin);
     }
-    rewritten.replace(&format!("//{from_authority}"), &format!("//{to_authority}"))
+    rewritten = rewritten.replace(&format!("//{from_authority}"), &format!("//{to_authority}"));
+    match google_url {
+        Some(public_url) => rewrite_google_urls(&rewritten, public_url),
+        None => rewritten,
+    }
+}
+
+fn rewrite_google_urls(value: &str, public_url: &Url) -> String {
+    // ponytail: literal URLs only; use a syntax-aware parser if escaped forms must be supported.
+    let replacement = format!(
+        "{}{GOOGLE_FAIL_PATH}",
+        public_url.origin().ascii_serialization()
+    );
+    let mut rewritten = String::new();
+    let mut cursor = 0;
+    for (index, _) in value.match_indices("//") {
+        let start = if index >= 6
+            && value
+                .get(index - 6..index)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https:"))
+        {
+            index - 6
+        } else if index >= 5
+            && value
+                .get(index - 5..index)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http:"))
+        {
+            index - 5
+        } else if index == 0
+            || value[..index].chars().next_back().is_some_and(|ch| {
+                ch.is_whitespace() || matches!(ch, '\'' | '"' | '(' | '=' | '<' | '>' | '`')
+            })
+        {
+            index
+        } else {
+            continue;
+        };
+        let authority = value[index + 2..]
+            .split(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '/' | '?' | '#' | '\'' | '"' | '(' | ')' | '<' | '>' | '\\' | '`' | ';' | '{' | '}')
+            })
+            .next()
+            .unwrap_or_default();
+        if start < cursor
+            || !Url::parse(&format!("https://{authority}/")).is_ok_and(|url| is_google_service(&url))
+        {
+            continue;
+        }
+        rewritten.push_str(&value[cursor..start]);
+        rewritten.push_str(&replacement);
+        cursor = index + 2 + authority.len();
+    }
+    rewritten.push_str(&value[cursor..]);
+    rewritten
 }
 
 fn authority(url: &Url) -> String {
@@ -502,6 +612,55 @@ mod tests {
         assert!(parse_debug(Some("true")).unwrap());
         assert!(parse_debug(Some("TRUE")).is_err());
         assert!(parse_debug(Some("1")).is_err());
+    }
+
+    #[test]
+    fn parses_google_fail_setting() {
+        assert_eq!(parse_google_fail(None).unwrap(), None);
+        for value in ["200", "403", "500", "599"] {
+            assert_eq!(
+                parse_google_fail(Some(value)).unwrap().unwrap().as_str(),
+                value
+            );
+        }
+        for value in ["", "100", "101", "199", "600", "999", "4030", " 403", "403 ", "abc"] {
+            assert!(parse_google_fail(Some(value)).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn rewrites_google_service_urls_without_matching_lookalikes() {
+        let public = Url::parse("https://mirror.example:8443/").unwrap();
+        for source in [
+            "https://googleapis.com/css2?family=Roboto",
+            "HTTP://Fonts.GoogleApis.Com/css2?family=Roboto",
+            "//fonts.googleapis.com/css2?family=Roboto",
+            "https://fonts.gstatic.com:443/css2?family=Roboto",
+            "https://fonts.gstatic.com./css2?family=Roboto",
+        ] {
+            assert_eq!(
+                rewrite_google_urls(&format!("字体 @import url('{source}');"), &public),
+                "字体 @import url('https://mirror.example:8443/__mirror_google_fail/css2?family=Roboto');"
+            );
+        }
+        for source in [
+            "https://notgoogleapis.com/css",
+            "https://googleapis.com.example/css",
+            "https://fonts.gstatic.com@other.example/css",
+            "https://example.com//fonts.googleapis.com/css",
+            "//example.com/fonts.googleapis.com/css",
+            "ftp://fonts.googleapis.com/css",
+            "https:\\/\\/fonts.googleapis.com/css",
+        ] {
+            assert_eq!(rewrite_google_urls(source, &public), source);
+        }
+        assert_eq!(
+            rewrite_google_urls(
+                "@import 'https://fonts.googleapis.com/css'; src:url(//fonts.gstatic.com/font.woff2);",
+                &public
+            ),
+            "@import 'https://mirror.example:8443/__mirror_google_fail/css'; src:url(https://mirror.example:8443/__mirror_google_fail/font.woff2);"
+        );
     }
 
     #[test]
@@ -605,7 +764,8 @@ mod tests {
             rewrite_text(
                 "https://upstream.example/a //upstream.example/b ftp://upstream.example/c rsync://upstream.example/d",
                 &upstream,
-                &public
+                &public,
+                None
             ),
             "https://mirror.example:8443/a //mirror.example:8443/b https://mirror.example:8443/c https://mirror.example:8443/d"
         );
@@ -626,7 +786,7 @@ mod tests {
             ),
         ]);
 
-        rewrite_response_headers(&mut headers, &upstream, &shadow);
+        rewrite_response_headers(&mut headers, &upstream, &shadow, None);
 
         assert_eq!(
             headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
@@ -644,6 +804,7 @@ mod tests {
             client: reqwest::Client::new(),
             upstream: Url::parse("https://example.com/").unwrap(),
             shadow_domain: None,
+            google_fail: None,
             debug: false,
         };
         let request = Request::builder().uri("/").body(Body::empty()).unwrap();
@@ -674,20 +835,38 @@ mod tests {
 
     #[tokio::test]
     async fn relays_method_path_query_body_and_rewrites_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let upstream_origin = format!("http://{address}");
         let body_origin = upstream_origin.clone();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream_requests = requests.clone();
         let upstream_app = Router::new().fallback(any(move |request: Request<Body>| {
             let body_origin = body_origin.clone();
+            let upstream_requests = upstream_requests.clone();
             async move {
+                upstream_requests.fetch_add(1, Ordering::SeqCst);
                 let method = request.method().clone();
                 let uri = request.uri().clone();
                 let body = to_bytes(request.into_body(), 1024).await.unwrap();
+                if uri.path().ends_with("/style.css") {
+                    return (
+                        [
+                            (header::CONTENT_TYPE, "text/css"),
+                            (header::LINK, "<https://fonts.googleapis.com/css>; rel=stylesheet"),
+                        ],
+                        "@import url('https://fonts.googleapis.com/css'); src:url(//fonts.gstatic.com/font.woff2);".to_owned(),
+                    );
+                }
                 (
-                    [(header::CONTENT_TYPE, "text/html")],
+                    [
+                        (header::CONTENT_TYPE, "text/html"),
+                        (header::LINK, "<https://fonts.googleapis.com/css>; rel=stylesheet"),
+                    ],
                     format!(
-                        "{method} {uri} {} <a href=\"{body_origin}/asset\">asset</a>",
+                        "{method} {uri} {} <a href=\"{body_origin}/asset\">asset</a> <style>@import url('https://fonts.googleapis.com/css'); src:url(//fonts.gstatic.com/font.woff2);</style>",
                         String::from_utf8(body.to_vec()).unwrap()
                     ),
                 )
@@ -703,30 +882,115 @@ mod tests {
                 "https://shadow.example",
             ),
         ] {
-            let state = AppState {
-                client: reqwest::Client::builder()
-                    .redirect(Policy::none())
-                    .build()
-                    .unwrap(),
-                upstream: Url::parse(&format!("{upstream_origin}/base/")).unwrap(),
-                shadow_domain,
-                debug: false,
-            };
-            let request = Request::builder()
-                .method("POST")
-                .uri("/nested?q=1")
-                .header(header::HOST, "mirror.example")
-                .body(Body::from("payload"))
-                .unwrap();
+            for google_fail in [
+                None,
+                Some(StatusCode::FORBIDDEN),
+                Some(StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let state = AppState {
+                    client: reqwest::Client::builder()
+                        .redirect(Policy::none())
+                        .build()
+                        .unwrap(),
+                    upstream: Url::parse(&format!("{upstream_origin}/base/")).unwrap(),
+                    shadow_domain: shadow_domain.clone(),
+                    google_fail,
+                    debug: false,
+                };
+                let router = app(state);
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/nested?q=1")
+                    .header(header::HOST, "mirror.example")
+                    .body(Body::from("payload"))
+                    .unwrap();
 
-            let response = app(state).oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                to_bytes(response.into_body(), 4096).await.unwrap(),
-                format!(
-                    "POST /base/nested?q=1 payload <a href=\"{expected_origin}/asset\">asset</a>"
-                )
-            );
+                let response = router.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let google_origin = if google_fail.is_some() {
+                    "http://mirror.example/__mirror_google_fail"
+                } else {
+                    "https://fonts.googleapis.com"
+                };
+                let font_origin = if google_fail.is_some() {
+                    google_origin
+                } else {
+                    "//fonts.gstatic.com"
+                };
+                assert_eq!(
+                    response.headers()[header::LINK],
+                    format!("<{google_origin}/css>; rel=stylesheet")
+                );
+                assert_eq!(
+                    to_bytes(response.into_body(), 4096).await.unwrap(),
+                    format!(
+                        "POST /base/nested?q=1 payload <a href=\"{expected_origin}/asset\">asset</a> <style>@import url('{google_origin}/css'); src:url({font_origin}/font.woff2);</style>"
+                    )
+                );
+                let before = requests.load(Ordering::SeqCst);
+                let stylesheet = router.clone().oneshot(
+                    Request::builder()
+                        .uri("/style.css")
+                        .header(header::HOST, "mirror.example")
+                        .body(Body::empty())
+                        .unwrap()
+                ).await.unwrap();
+                assert_eq!(stylesheet.status(), StatusCode::OK);
+                assert_eq!(stylesheet.headers()[header::CONTENT_TYPE], "text/css");
+                assert_eq!(
+                    to_bytes(stylesheet.into_body(), 1024).await.unwrap(),
+                    format!("@import url('{google_origin}/css'); src:url({font_origin}/font.woff2);")
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), before + 1);
+                let before = requests.load(Ordering::SeqCst);
+                for path in [
+                    GOOGLE_FAIL_PATH,
+                    "/__mirror_google_fail/css?family=Roboto",
+                    "/__mirror_google_fail/font.woff2",
+                    "/__mirror_google_fail_other",
+                ] {
+                    let response = router.clone().oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header(header::HOST, "mirror.example")
+                            .body(Body::empty())
+                            .unwrap()
+                    ).await.unwrap();
+                    if let Some(status) = google_fail.filter(|_| path != "/__mirror_google_fail_other") {
+                        assert_eq!(response.status(), status);
+                        assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+                        assert_eq!(requests.load(Ordering::SeqCst), before);
+                    } else {
+                        assert_eq!(response.status(), StatusCode::OK);
+                    }
+                }
+            }
+        }
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&upstream_origin).unwrap())
+            .build()
+            .unwrap();
+        let before = requests.load(Ordering::SeqCst);
+        for host in ["googleapis.com", "fonts.googleapis.com", "fonts.gstatic.com"] {
+            for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+                let router = app(AppState {
+                    client: client.clone(),
+                    upstream: Url::parse(&format!("http://{host}/")).unwrap(),
+                    shadow_domain: None,
+                    google_fail: Some(status),
+                    debug: false,
+                });
+                let response = router.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/css?family=Roboto")
+                        .header(header::HOST, "mirror.example")
+                        .body(Body::from("payload"))
+                        .unwrap()
+                ).await.unwrap();
+                assert_eq!(response.status(), status);
+                assert_eq!(requests.load(Ordering::SeqCst), before);
+            }
         }
         server.abort();
     }

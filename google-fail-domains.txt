@@ -1,0 +1,4 @@
+# One domain per line; subdomains are included. Blank lines and comments are ignored.
+# Embedded at build time: rebuild after changing this list.
+googleapis.com
+gstatic.com

@@ -9,6 +9,7 @@ This document describes the current repository so an agent can understand, run, 
 | [Cargo.toml](./Cargo.toml), [Cargo.lock](./Cargo.lock) | Rust 2024 package, dependencies and lockfile. |
 | [src/main.rs](./src/main.rs) | Entire server: configuration, routing, forwarding, rewriting, logging, and unit/integration tests. There is no library crate. |
 | [.env.example](./.env.example) | Example local configuration; actual `.env` is ignored by Git. |
+| [google-fail-domains.txt](./google-fail-domains.txt) | Human-maintained domain list embedded into the binary for optional Google Fonts interception. |
 | [Dockerfile](./Dockerfile), [.dockerignore](./.dockerignore) | Multistage container build and build-context exclusions. |
 | [.github/workflows/publish-container.yml](./.github/workflows/publish-container.yml) | Container publication on version tags. |
 | [README.md](./README.md) | Short project overview and invocation examples. |
@@ -33,20 +34,24 @@ Environment variables already present in the process take precedence over `.env`
 | `SHADOW_DOMAIN` | Origin used for URL replacement in response headers and text bodies. Does **not** change upstream target or incoming request routing. | Unset/empty: derive public origin from each request. Otherwise same clean-hostname validation as `MIRROR_UPSTREAM`; replacements use HTTPS. |
 | `MIRROR_BIND` | TCP listen address. | `0.0.0.0:3000`; must parse as a socket address. |
 | `DEBUG` | Emit startup and per-request logs. | `false`; only literal lowercase `true` or `false` accepted. |
+| `GOOGLE_FAIL` | Return the selected status immediately for listed Google services instead of contacting them. | Omitted: disabled. Present: exactly one final HTTP status from `200` to `599`, such as `403` or `500`; empty, malformed, and informational statuses fail startup. |
 
 For example, with upstream `example.com` and bind `127.0.0.1:3000`, a request for `http://localhost:3000/path?q=1` targets `https://example.com/path?q=1`. A public reverse proxy may terminate HTTPS and forward to this HTTP listener. Its `X-Forwarded-Host` and `X-Forwarded-Proto` values determine the public origin used in response rewriting unless `SHADOW_DOMAIN` is set. Do not expose this listener to clients that can forge those headers if their influence on generated links matters; there is no trusted-proxy validation in the application.
 
 ## Request-to-response flow
 
 ```text
-client -> Axum catch-all -> public URL + target URL -> filter/rewrite request headers
-       -> Reqwest HTTPS upstream (request body streamed)
-       -> filter/rewrite response headers -> buffer/rewrite eligible text OR stream other bodies
-       -> client
+client -> Axum catch-all -> public URL validation
+       -> GOOGLE_FAIL enabled + listed upstream/reserved path -> immediate status, empty body
+       -> otherwise: target URL -> filter/rewrite request headers
+          -> Reqwest HTTPS upstream (request body streamed)
+          -> filter/rewrite response headers -> buffer/rewrite eligible text OR stream other bodies
+          -> client
 ```
 
-1. `main` calls `run`, which loads `.env`, validates configuration, constructs one shared Reqwest client with automatic redirects disabled, binds TCP, and serves the Axum router with socket connection metadata. The router has one fallback handler for **all paths and HTTP methods**; there are no dedicated API, health, or static-file routes.
+1. `main` calls `run`, which loads `.env`, validates configuration, constructs one shared Reqwest client with automatic redirects disabled, binds TCP, and serves the Axum router with socket connection metadata. The router has one fallback handler for **all paths and HTTP methods**; there are no dedicated API, health, or static-file routes. With `GOOGLE_FAIL` enabled, the handler reserves `/__mirror_google_fail` and its slash-prefixed descendants for immediate local responses.
 2. `proxy` reads client IP from socket metadata (or `unknown` when absent) and records the URL path for optional logging. It derives a public base URL from the first comma-separated `X-Forwarded-Host` value, falling back to `Host`; likewise `X-Forwarded-Proto` supplies `http` or `https`, defaulting to `http`. Missing/invalid host or invalid forwarded protocol returns HTTP 400. These forwarded values are trusted as provided.
+   After public-origin validation, when `GOOGLE_FAIL` is enabled, a listed upstream hostname or reserved path returns the configured status with an empty body, before consuming the request body or sending any upstream request. Debug logging still records this response. Unlisted upstreams and other paths retain normal forwarding behavior.
 3. `target_url` clones the configured upstream URL and attaches the incoming request path and query. `proxy` preserves the incoming HTTP method and streams its body to Reqwest. It strips hop-by-hop headers, headers named in `Connection`, `Host`, and incoming `Content-Length`; Reqwest supplies the destination host. It replaces occurrences of the public origin in `Origin` and `Referer` with the upstream origin, then sets `Accept-Encoding: identity`.
 4. Reqwest does **not** follow upstream redirects. `build_response` carries the upstream status through unchanged. It filters response hop-by-hop headers and `Host`. For rewritten bodies it also removes `Content-Length`; otherwise it retains that header. It rewrites selected response header values and removes exact-upstream cookie `Domain` attributes as described below.
 5. If `Content-Type` is eligible **and** there is no `Content-Encoding` header, `build_response` reads the **entire** upstream body into memory, performs UTF-8 string replacement, and returns those bytes. Invalid UTF-8 stays byte-for-byte unchanged but still takes this buffered path. All other bodies stream as chunks without content rewriting. Upstream send/body-read errors return HTTP 502 (`upstream request failed`). An error while streaming a non-rewritten body may occur after response headers were sent, not as a new 502.
@@ -59,11 +64,20 @@ Text rewriting is plain, case-sensitive substring replacement, **not** HTML pars
 
 Response headers rewritten using the same text function: `Location`, `Content-Location`, `Link`, `Refresh`, `Access-Control-Allow-Origin`, and `Content-Security-Policy`. Repeated header values are preserved. `Set-Cookie` is handled separately: a `Domain` attribute exactly matching the upstream hostname (case-insensitive, optionally preceded by a dot) is removed, allowing a browser to treat that cookie as host-only for the proxy host. Other cookie attributes and domains pass through. Setting `SHADOW_DOMAIN` does not rewrite cookie domains to the shadow host.
 
+### Optional Google Fonts interception
+
+[google-fail-domains.txt](./google-fail-domains.txt) contains one hostname per line; surrounding whitespace, blank lines, and full-line `#` comments are ignored. Hostname matching is case-insensitive and includes exact domains and dot-separated subdomains, not substring lookalikes such as `notgoogleapis.com` or `googleapis.com.example`. The initial domains are `googleapis.com` (including `fonts.googleapis.com`) and `gstatic.com` (including `fonts.gstatic.com`). This is a maintained selection, not automatic GFW-block detection. The file is embedded with `include_str!`; rebuilding the binary/container is required after list changes.
+
+When `GOOGLE_FAIL` is set, `rewrite_google_urls` scans literal HTTP, HTTPS, and protocol-relative URLs in the same eligible UTF-8 bodies and response headers used by normal rewriting. It replaces listed origins with the **actual public request origin** followed by `/__mirror_google_fail`, retaining the original path, query, and fragment. For example, `https://fonts.googleapis.com/css2?family=Roboto` becomes `https://mirror.example/__mirror_google_fail/css2?family=Roboto` for public origin `https://mirror.example`. CSS `@import` and `url(...)`, HTML attributes, and Google font-file URLs therefore reach the local failure handler without Google DNS, connection, or response waits. This local origin does not use `SHADOW_DOMAIN`, which remains solely the destination for ordinary upstream URL rewrites.
+
+Interception uses the existing text eligibility/encoding rules: compressed or invalid-UTF-8 bodies are not rewritten. It is not a CSS/HTML/JavaScript parser and cannot intercept escaped URLs or URLs constructed dynamically, nor browser traffic that bypasses this server. The reserved path can collide with upstream paths while enabled; omitting `GOOGLE_FAIL` restores forwarding for those paths too. Request `Origin`/`Referer` and cookies retain their existing behavior.
+
 ### Errors and logging
 
 | Situation | Result |
 | --- | --- |
 | Invalid/missing `Host`, invalid public URL, invalid `X-Forwarded-Proto` | HTTP 400, plain-text cause. |
+| `GOOGLE_FAIL` enabled and upstream hostname is listed or path is reserved | Configured status, empty body, no upstream request. |
 | Reqwest upstream send failure or buffered body read failure | HTTP 502, `upstream request failed`. |
 | Valid upstream response, including 3xx/4xx/5xx | Same HTTP status, with applicable header/body rewrites. |
 | Configuration, HTTP client creation, or listener failure | Startup error on stderr and process exits with status 1. |
@@ -83,11 +97,12 @@ The Dockerfile builds a locked release binary in a Rust Bookworm builder, copies
 
 The GitHub Actions workflow triggers on pushed tags matching `v*`, uses Docker Buildx and GitHub Container Registry, and publishes `latest`, the semantic version, major.minor, and a commit-derived tag for `linux/amd64`. The image name derives from the repository name. This is publication behavior, not a command to run locally.
 
-Tests live at the end of `src/main.rs`. They cover debug parsing/status categories, clean-host validation, hop-by-hop header removal, URL and response-header rewrites, forwarded public-origin derivation, missing-Host rejection, and a local HTTP upstream exercising method/path/query/body forwarding and response rewrite (with and without shadow domain). The local upstream in that test is directly injected into application state; normal startup still requires an HTTPS hostname. There is no separate end-to-end TLS, Docker, or public reverse-proxy test.
+Tests live at the end of [src/main.rs](./src/main.rs). They cover debug and `GOOGLE_FAIL` parsing/status categories, clean-host validation, hop-by-hop header removal, URL and response-header rewrites, Google domain matching and lookalikes, forwarded public-origin derivation, missing-Host rejection, and a local HTTP upstream exercising method/path/query/body forwarding and response rewrite (with and without shadow domain and Google interception). An upstream request counter verifies intercepted paths and listed destinations send no upstream requests; omitted configuration and unreserved paths still forward. The local upstream in that test is directly injected into application state; normal startup still requires an HTTPS hostname. There is no separate end-to-end TLS, Docker, or public reverse-proxy test.
 
 ## Modification guide and boundaries
 
 - Configuration changes belong in `run` and its parsers; update `.env.example`, documented defaults, and validation tests together. The only configured destination is `MIRROR_UPSTREAM`; do not turn untrusted request data into a new upstream target.
+- Maintain intercepted domains in [google-fail-domains.txt](./google-fail-domains.txt), not Rust code; its build-time inclusion must remain available in the Docker build context. `parse_google_fail`, `is_google_service`, and `rewrite_google_urls` own validation, domain membership, and local URL mapping. Keep intercepted requests in the shared handler so they retain logging and bypass upstream I/O.
 - Request routing and forwarding live in `app`, `proxy`, `target_url`, `request_public_url`, `filtered_headers`, and `rewrite_request_headers`. `SHADOW_DOMAIN` is response-only; request `Origin`/`Referer` rewrites use the actual public request URL.
 - Response behavior lives in `build_response`, `is_rewritable`, `rewrite_response_headers`, `rewrite_cookies`, and `rewrite_text`. If changing URL rewriting, check **both** response headers and body paths, along with cookie semantics, content encoding, and `Content-Length` handling.
 - `ProxyError` maps request failures to 400 and upstream failures to 502. `LogCategory` and `log` own severity/timestamp formatting. Keep error and debug semantics aligned with these paths.

@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS builder
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock google-fail-domains.txt ./
 COPY src ./src
 RUN cargo build --locked --release
 

@@ -20,6 +20,7 @@ Optional settings:
 - `MIRROR_BIND`: listening address. Default: `0.0.0.0:3000`.
 - `SHADOW_DOMAIN`: clean hostname used when rewriting URLs in response content and response headers. Rewrites use `https://SHADOW_DOMAIN`; leave it empty to use each request's public address. The upstream request target remains `MIRROR_UPSTREAM`.
 - `DEBUG`: set to `true` for terminal request logs or `false` to disable them. Default: `false`.
+- `GOOGLE_FAIL`: optional final HTTP status (`200`–`599`, for example `403` or `500`). When set, Google Fonts URLs in rewritten content and headers point to local responses with that status and an empty body; no Google request is sent. Omit to disable; an empty or invalid value fails startup. Domains are maintained in [google-fail-domains.txt](./google-fail-domains.txt), one per line including subdomains; rebuild after editing. The initial list covers `googleapis.com` and `gstatic.com`.
 
 Debug logs include a UTC timestamp, `INFO`, `WARN`, or `ERR` category, client IP address, request path, and response status. Query strings are omitted.
 
