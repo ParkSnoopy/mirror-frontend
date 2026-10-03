@@ -34,7 +34,7 @@ const SHADOW_DOMAIN_ENV: &str = "SHADOW_DOMAIN";
 const BIND_ENV: &str = "MIRROR_BIND";
 const DEBUG_ENV: &str = "DEBUG";
 const GOOGLE_FAIL_ENV: &str = "GOOGLE_FAIL";
-const GOOGLE_FAIL_PATH: &str = "/__mirror_google_fail";
+const GOOGLE_FAIL_PATH: &str = "/__mirror_response";
 const GOOGLE_FAIL_DOMAINS: &str = include_str!("../google-fail-domains.txt");
 
 #[derive(Clone)]
@@ -42,8 +42,31 @@ struct AppState {
     client: reqwest::Client,
     upstream: Url,
     shadow_domain: Option<Url>,
-    google_fail: Option<StatusCode>,
+    google_fail: Option<GoogleFail>,
     debug: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoogleFail {
+    Forbidden,
+    NotFound,
+    InternalServerError,
+}
+
+impl GoogleFail {
+    fn response(self) -> (StatusCode, &'static str) {
+        match self {
+            Self::Forbidden => (StatusCode::FORBIDDEN, "Forbidden"),
+            Self::NotFound => (StatusCode::NOT_FOUND, "Not Found"),
+            Self::InternalServerError => (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+        }
+    }
+}
+
+impl IntoResponse for GoogleFail {
+    fn into_response(self) -> Response<Body> {
+        self.response().into_response()
+    }
 }
 
 #[tokio::main]
@@ -120,18 +143,14 @@ fn app(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-fn parse_google_fail(value: Option<&str>) -> Result<Option<StatusCode>, String> {
-    value
-        .map(|value| {
-            value
-                .parse::<StatusCode>()
-                .ok()
-                .filter(|status| (200..600).contains(&status.as_u16()))
-                .ok_or_else(|| {
-                    format!("{GOOGLE_FAIL_ENV} must be an HTTP status code from 200 to 599")
-                })
-        })
-        .transpose()
+fn parse_google_fail(value: Option<&str>) -> Result<Option<GoogleFail>, String> {
+    match value {
+        None => Ok(None),
+        Some("403") => Ok(Some(GoogleFail::Forbidden)),
+        Some("404") => Ok(Some(GoogleFail::NotFound)),
+        Some("500") => Ok(Some(GoogleFail::InternalServerError)),
+        Some(_) => Err(format!("{GOOGLE_FAIL_ENV} must be 403, 404, or 500")),
+    }
 }
 
 fn is_google_service(url: &Url) -> bool {
@@ -159,12 +178,12 @@ async fn proxy(
     let path = request.uri().path().to_owned();
     let result = async {
         let public_url = request_public_url(&request)?;
-        if let Some(status) = state.google_fail
+        if let Some(failure) = state.google_fail
             && (is_google_service(&state.upstream)
                 || path == GOOGLE_FAIL_PATH
                 || path.starts_with(&format!("{GOOGLE_FAIL_PATH}/")))
         {
-            return Ok(status.into_response());
+            return Ok(failure.into_response());
         }
         let target = target_url(&state.upstream, request.uri());
         let (parts, body) = request.into_parts();
@@ -617,13 +636,18 @@ mod tests {
     #[test]
     fn parses_google_fail_setting() {
         assert_eq!(parse_google_fail(None).unwrap(), None);
-        for value in ["200", "403", "500", "599"] {
+        for (value, failure, status, body) in [
+            ("403", GoogleFail::Forbidden, StatusCode::FORBIDDEN, "Forbidden"),
+            ("404", GoogleFail::NotFound, StatusCode::NOT_FOUND, "Not Found"),
+            ("500", GoogleFail::InternalServerError, StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+        ] {
             assert_eq!(
-                parse_google_fail(Some(value)).unwrap().unwrap().as_str(),
-                value
+                parse_google_fail(Some(value)).unwrap(),
+                Some(failure)
             );
+            assert_eq!(failure.response(), (status, body));
         }
-        for value in ["", "100", "101", "199", "600", "999", "4030", " 403", "403 ", "abc"] {
+        for value in ["", "100", "200", "301", "401", "410", "502", "503", "599", "600", "999", "4030", " 403", "403 ", "abc"] {
             assert!(parse_google_fail(Some(value)).is_err(), "accepted {value:?}");
         }
     }
@@ -640,7 +664,7 @@ mod tests {
         ] {
             assert_eq!(
                 rewrite_google_urls(&format!("字体 @import url('{source}');"), &public),
-                "字体 @import url('https://mirror.example:8443/__mirror_google_fail/css2?family=Roboto');"
+                "字体 @import url('https://mirror.example:8443/__mirror_response/css2?family=Roboto');"
             );
         }
         for source in [
@@ -659,7 +683,7 @@ mod tests {
                 "@import 'https://fonts.googleapis.com/css'; src:url(//fonts.gstatic.com/font.woff2);",
                 &public
             ),
-            "@import 'https://mirror.example:8443/__mirror_google_fail/css'; src:url(https://mirror.example:8443/__mirror_google_fail/font.woff2);"
+            "@import 'https://mirror.example:8443/__mirror_response/css'; src:url(https://mirror.example:8443/__mirror_response/font.woff2);"
         );
     }
 
@@ -884,8 +908,9 @@ mod tests {
         ] {
             for google_fail in [
                 None,
-                Some(StatusCode::FORBIDDEN),
-                Some(StatusCode::INTERNAL_SERVER_ERROR),
+                Some(GoogleFail::Forbidden),
+                Some(GoogleFail::NotFound),
+                Some(GoogleFail::InternalServerError),
             ] {
                 let state = AppState {
                     client: reqwest::Client::builder()
@@ -908,7 +933,7 @@ mod tests {
                 let response = router.clone().oneshot(request).await.unwrap();
                 assert_eq!(response.status(), StatusCode::OK);
                 let google_origin = if google_fail.is_some() {
-                    "http://mirror.example/__mirror_google_fail"
+                    "http://mirror.example/__mirror_response"
                 } else {
                     "https://fonts.googleapis.com"
                 };
@@ -945,9 +970,9 @@ mod tests {
                 let before = requests.load(Ordering::SeqCst);
                 for path in [
                     GOOGLE_FAIL_PATH,
-                    "/__mirror_google_fail/css?family=Roboto",
-                    "/__mirror_google_fail/font.woff2",
-                    "/__mirror_google_fail_other",
+                    "/__mirror_response/css?family=Roboto",
+                    "/__mirror_response/font.woff2",
+                    "/__mirror_response_other",
                 ] {
                     let response = router.clone().oneshot(
                         Request::builder()
@@ -956,9 +981,17 @@ mod tests {
                             .body(Body::empty())
                             .unwrap()
                     ).await.unwrap();
-                    if let Some(status) = google_fail.filter(|_| path != "/__mirror_google_fail_other") {
+                    if let Some(failure) = google_fail.filter(|_| path != "/__mirror_response_other") {
+                        let (status, message) = failure.response();
                         assert_eq!(response.status(), status);
-                        assert!(to_bytes(response.into_body(), 1024).await.unwrap().is_empty());
+                        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+                        assert!(response.headers().iter().all(|(name, value)| {
+                            !name.as_str().contains("google")
+                                && !name.as_str().contains("block")
+                                && !value.to_str().unwrap().contains("google")
+                                && !value.to_str().unwrap().contains("block")
+                        }));
+                        assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), message);
                         assert_eq!(requests.load(Ordering::SeqCst), before);
                     } else {
                         assert_eq!(response.status(), StatusCode::OK);
@@ -972,24 +1005,29 @@ mod tests {
             .unwrap();
         let before = requests.load(Ordering::SeqCst);
         for host in ["googleapis.com", "fonts.googleapis.com", "fonts.gstatic.com"] {
-            for status in [StatusCode::FORBIDDEN, StatusCode::INTERNAL_SERVER_ERROR] {
+            for failure in [GoogleFail::Forbidden, GoogleFail::NotFound, GoogleFail::InternalServerError] {
                 let router = app(AppState {
                     client: client.clone(),
                     upstream: Url::parse(&format!("http://{host}/")).unwrap(),
                     shadow_domain: None,
-                    google_fail: Some(status),
+                    google_fail: Some(failure),
                     debug: false,
                 });
-                let response = router.oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/css?family=Roboto")
-                        .header(header::HOST, "mirror.example")
-                        .body(Body::from("payload"))
-                        .unwrap()
-                ).await.unwrap();
-                assert_eq!(response.status(), status);
-                assert_eq!(requests.load(Ordering::SeqCst), before);
+                for method in ["POST", "HEAD"] {
+                    let response = router.clone().oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri("/css?family=Roboto")
+                            .header(header::HOST, "mirror.example")
+                            .body(Body::from("payload"))
+                            .unwrap()
+                    ).await.unwrap();
+                    let (status, message) = failure.response();
+                    assert_eq!(response.status(), status);
+                    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+                    assert_eq!(body, if method == "HEAD" { "" } else { message });
+                    assert_eq!(requests.load(Ordering::SeqCst), before);
+                }
             }
         }
         server.abort();
